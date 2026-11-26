@@ -1,0 +1,7 @@
+# PyInstaller intermediates
+build/
+__pycache__/
+*.py[cod]
+# dist: only the release exe is tracked
+dist/*
+!dist/LC_BPF_Designer.exe
