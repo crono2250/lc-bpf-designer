@@ -2,8 +2,8 @@
 
 
 a = Analysis(
-    ['D:/claude/lc-bpf-designer/lc_bpf_designer.pyw'],
-    pathex=['D:/claude/lc-bpf-designer'],
+    ['lc_bpf_designer.pyw'],
+    pathex=[],
     binaries=[],
     datas=[],
     hiddenimports=[],

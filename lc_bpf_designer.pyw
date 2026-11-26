@@ -1,8 +1,5 @@
-"""LC BPF 設計ツール（GUI）。Python 3 標準ライブラリ（tkinter）のみで動作。
-
-起動: run.bat をダブルクリック（または本ファイルをダブルクリック）
-"""
-from __future__ import annotations
+#!/usr/bin/env python3
+"""LC バンドパスフィルタ設計ツール (tkinter GUI)."""
 
 import csv
 import math
@@ -12,724 +9,1053 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import lcbpf_core as core  # noqa: E402
+import bpf_core as bc  # noqa: E402
 
 UNITS = {"Hz": 1.0, "kHz": 1e3, "MHz": 1e6, "GHz": 1e9}
-KINDS = {"バタワース": "butterworth", "チェビシェフ": "chebyshev", "エリプティック": "elliptic"}
+FONT = ("Meiryo UI", 9)
+FONT_B = ("Meiryo UI", 9, "bold")
+FONT_S = ("Meiryo UI", 8)
 COL_IDEAL = "#1f5fbf"
-COL_E = "#e0662b"
-COL_ADJ = "#1a9a4a"
-COL_DEV = "#c62828"
-FONT = ("Yu Gothic UI", 9)
-FONT_S = ("Yu Gothic UI", 8)
+COL_ROUND = "#d0471c"
+COL_ADJ = "#13873a"
+COL_WIRE = "#222222"
 
 
-def parse_float(s: str, name: str) -> float:
-    try:
-        return float(s.strip().replace(",", ""))
-    except ValueError:
-        raise ValueError(f"{name} の値が数値ではありません: {s!r}")
+# ==========================================================================
+# circuit drawing
+# ==========================================================================
+H_LEAF = (104, 80, 66)   # w, h, terminal y-offset (horizontal element)
+V_LEAF = (126, 84, 14)   # w, h, terminal x-offset (vertical element)
+PAD = 14
+GAP = 8
 
 
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("LC BPF 設計ツール")
-        self.geometry("1360x860")
-        self.minsize(1000, 640)
+def _size(node, o):
+    k = node[0]
+    if k == "el":
+        return H_LEAF if o == "h" else V_LEAF
+    kids = [_size(c, o) for c in node[1]]
+    if (k == "ser" and o == "h") or (k == "par" and o == "v"):
+        # laid out along x
+        if k == "ser":
+            w = sum(c[0] for c in kids)
+            t = max(c[2] for c in kids)
+            h = t + max(c[1] - c[2] for c in kids)
+            return (w, h, t)
+        # par, vertical orientation: side by side, buses top & bottom
+        w = sum(c[0] for c in kids) + GAP * (len(kids) - 1)
+        h = max(c[1] for c in kids) + 2 * PAD
+        return (w, h, kids[0][2])
+    # laid out along y
+    if k == "ser":  # ser, vertical
+        h = sum(c[1] for c in kids)
+        t = max(c[2] for c in kids)
+        w = t + max(c[0] - c[2] for c in kids)
+        return (w, h, t)
+    # par, horizontal: stacked, buses left & right
+    w = max(c[0] for c in kids) + 2 * PAD
+    h = sum(c[1] for c in kids) + GAP * (len(kids) - 1)
+    return (w, h, kids[0][2])
+
+
+class CircuitView(object):
+    def __init__(self, canvas, on_wheel=None, on_click=None):
+        self.cv = canvas
+        self.show_rounded = True
+        # element labels: wheel steps the value, click selects it in the adjust panel
+        # (canvas items cannot take <MouseWheel>; the canvas-wide handler calls handle_wheel)
+        canvas.tag_bind("ellabel", "<Button-1>", self._click)
+        canvas.tag_bind("ellabel", "<Enter>", lambda e: canvas.configure(cursor="hand2"))
+        canvas.tag_bind("ellabel", "<Leave>", lambda e: canvas.configure(cursor=""))
+        self.on_wheel = on_wheel
+        self.on_click = on_click
+
+    def _name_at(self):
+        for tag in self.cv.gettags("current"):
+            if tag.startswith("el:"):
+                return tag[3:]
+        return None
+
+    def handle_wheel(self, ev):
+        """Wheel over an element label steps its value; returns True if consumed."""
+        name = self._name_at()
+        if name and self.on_wheel:
+            self.on_wheel(name, 1 if ev.delta > 0 else -1)
+            return True
+        return False
+
+    def _click(self, ev):
+        name = self._name_at()
+        if name and self.on_click:
+            self.on_click(name)
+
+    def line(self, *pts, **kw):
+        kw.setdefault("fill", COL_WIRE)
+        kw.setdefault("width", 1.5)
+        self.cv.create_line(*pts, **kw)
+
+    # ---- symbols ---------------------------------------------------------
+    def sym_inductor(self, x1, y1, x2, y2):
+        if y1 == y2:
+            n = 4
+            step = (x2 - x1) / float(n)
+            r = step / 2
+            for i in range(n):
+                xa = x1 + i * step
+                self.cv.create_arc(xa, y1 - r, xa + step, y1 + r, start=0, extent=180,
+                                   style="arc", outline=COL_WIRE, width=1.5)
+        else:
+            n = 4
+            step = (y2 - y1) / float(n)
+            r = step / 2
+            for i in range(n):
+                ya = y1 + i * step
+                self.cv.create_arc(x1 - r, ya, x1 + r, ya + step, start=-90, extent=180,
+                                   style="arc", outline=COL_WIRE, width=1.5)
+
+    def sym_capacitor(self, x1, y1, x2, y2):
+        if y1 == y2:
+            xm = (x1 + x2) / 2.0
+            self.line(x1, y1, xm - 4, y1)
+            self.line(xm + 4, y1, x2, y1)
+            self.line(xm - 4, y1 - 11, xm - 4, y1 + 11, width=2.5)
+            self.line(xm + 4, y1 - 11, xm + 4, y1 + 11, width=2.5)
+        else:
+            ym = (y1 + y2) / 2.0
+            self.line(x1, y1, x1, ym - 4)
+            self.line(x1, ym + 4, x1, y2)
+            self.line(x1 - 11, ym - 4, x1 + 11, ym - 4, width=2.5)
+            self.line(x1 - 11, ym + 4, x1 + 11, ym + 4, width=2.5)
+
+    def sym_resistor(self, x1, y1, x2, y2):
+        pts = []
+        if y1 == y2:
+            n = 6
+            step = (x2 - x1) / float(n)
+            pts = [x1, y1]
+            for i in range(n):
+                pts += [x1 + (i + 0.5) * step, y1 + (-7 if i % 2 == 0 else 7)]
+            pts += [x2, y1]
+        else:
+            n = 6
+            step = (y2 - y1) / float(n)
+            pts = [x1, y1]
+            for i in range(n):
+                pts += [x1 + (-7 if i % 2 == 0 else 7), y1 + (i + 0.5) * step]
+            pts += [x1, y2]
+        self.line(*pts)
+
+    def labels(self, el, x, y, anchor):
+        u = "H" if el["kind"] == "L" else "F"
+        ser = self.design.l_series if el["kind"] == "L" else self.design.c_series
+        tags = ("ellabel", "el:" + el["name"])
+        self.cv.create_text(x, y, text=el["name"], font=FONT_B, anchor=anchor, tags=tags)
+        self.cv.create_text(x, y + 14, text=bc.fmt_eng(el["ideal"], u, 4),
+                            font=FONT_S, fill=COL_IDEAL, anchor=anchor, tags=tags)
+        if self.show_rounded:
+            self.cv.create_text(x, y + 27, text="%s: %s" % (ser, bc.fmt_eng(el["rounded"], u, 3)),
+                                font=FONT_S, fill=COL_ROUND, anchor=anchor, tags=tags)
+        if el["adjusted"] != el["rounded"]:
+            dev = (el["adjusted"] / el["rounded"] - 1) * 100
+            self.cv.create_text(x, y + 40, text="→ %s (%+.1f%%)" % (bc.fmt_eng(el["adjusted"], u, 4), dev),
+                                font=FONT_B, fill=COL_ADJ, anchor=anchor, tags=tags)
+
+    # ---- recursive layout -----------------------------------------------
+    def draw(self, node, o, x, y):
+        w, h, t = _size(node, o)
+        k = node[0]
+        if k == "el":
+            el = node[1]
+            if o == "h":
+                yy = y + t
+                self.line(x, yy, x + 26, yy)
+                self.line(x + w - 26, yy, x + w, yy)
+                (self.sym_inductor if el["kind"] == "L" else self.sym_capacitor)(
+                    x + 26, yy, x + w - 26, yy)
+                self.labels(el, x + w / 2.0, y + 4, "n")
+            else:
+                xx = x + t
+                self.line(xx, y, xx, y + 14)
+                self.line(xx, y + h - 14, xx, y + h)
+                (self.sym_inductor if el["kind"] == "L" else self.sym_capacitor)(
+                    xx, y + 14, xx, y + h - 14)
+                self.labels(el, xx + 16, y + 12, "nw")
+            return
+        kids = node[1]
+        sizes = [_size(c, o) for c in kids]
+        if o == "h" and k == "ser":
+            cx = x
+            for c, (cw, ch, ct) in zip(kids, sizes):
+                self.draw(c, o, cx, y + t - ct)
+                cx += cw
+        elif o == "v" and k == "ser":
+            cy = y
+            for c, (cw, ch, ct) in zip(kids, sizes):
+                self.draw(c, o, x + t - ct, cy)
+                cy += ch
+        elif o == "h" and k == "par":
+            xl, xr = x + PAD / 2.0, x + w - PAD / 2.0
+            cy = y
+            ys = []
+            for c, (cw, ch, ct) in zip(kids, sizes):
+                self.draw(c, o, x + PAD, cy)
+                ty = cy + ct
+                ys.append(ty)
+                self.line(xl, ty, x + PAD, ty)
+                self.line(x + PAD + cw, ty, xr, ty)
+                cy += ch + GAP
+            self.line(xl, ys[0], xl, ys[-1])
+            self.line(xr, ys[0], xr, ys[-1])
+            self.line(x, y + t, xl, y + t)
+            self.line(xr, y + t, x + w, y + t)
+            self.dot(xl, y + t)
+            self.dot(xr, y + t)
+        else:  # par, vertical
+            yt, yb = y + PAD / 2.0, y + h - PAD / 2.0
+            cx = x
+            xs = []
+            for c, (cw, ch, ct) in zip(kids, sizes):
+                self.draw(c, o, cx, y + PAD)
+                tx = cx + ct
+                xs.append(tx)
+                self.line(tx, yt, tx, y + PAD)
+                self.line(tx, y + PAD + ch, tx, yb)
+                cx += cw + GAP
+            self.line(xs[0], yt, xs[-1], yt)
+            self.line(xs[0], yb, xs[-1], yb)
+            self.line(x + t, y, x + t, yt)
+            self.line(x + t, yb, x + t, y + h)
+            self.dot(x + t, yt)
+            self.dot(x + t, yb)
+
+    def dot(self, x, y):
+        self.cv.create_oval(x - 2.5, y - 2.5, x + 2.5, y + 2.5, fill=COL_WIRE, outline=COL_WIRE)
+
+    def render(self, design):
+        self.design = design
+        cv = self.cv
+        cv.delete("all")
+        top = 20
+        ser_sizes = [_size(t, "h") for p, t in design.branches if p == "series"]
+        sh_sizes = [_size(t, "v") for p, t in design.branches if p == "shunt"]
+        rail = top + max([s[2] for s in ser_sizes] + [40])
+        below = max([s[1] for s in sh_sizes] + [s[1] - s[2] for s in ser_sizes] + [70])
+        gnd = rail + below + 24
+        # source
+        x0 = 30
+        ym = (rail + gnd) / 2.0
+        self.line(x0, rail, x0, ym - 16)
+        self.line(x0, ym + 16, x0, gnd)
+        cv.create_oval(x0 - 16, ym - 16, x0 + 16, ym + 16, outline=COL_WIRE, width=1.5)
+        cv.create_text(x0, ym, text="~", font=("Meiryo UI", 14))
+        self.line(x0, rail, x0 + 20, rail)
+        self.sym_resistor(x0 + 20, rail, x0 + 80, rail)
+        cv.create_text(x0 + 50, rail - 26, text="Rs", font=FONT_B)
+        cv.create_text(x0 + 50, rail - 13, text=bc.fmt_eng(design.rs, "Ω", 4), font=FONT_S)
+        cx = x0 + 80
+        self.line(cx, rail, cx + 20, rail)
+        cx += 20
+        for pos, t in design.branches:
+            if pos == "series":
+                w, h, tt = _size(t, "h")
+                self.draw(t, "h", cx, rail - tt)
+                cx += w
+                self.line(cx, rail, cx + 12, rail)
+                cx += 12
+            else:
+                w, h, tt = _size(t, "v")
+                nx = cx + 16 + tt
+                self.line(cx, rail, cx + w + 32, rail)
+                self.draw(t, "v", cx + 16, rail)
+                self.line(nx, rail + h, nx, gnd)
+                self.dot(nx, rail)
+                self.dot(nx, gnd)
+                cx += w + 32
+        # load
+        xl = cx + 30
+        self.line(cx, rail, xl, rail)
+        self.line(xl, rail, xl, ym - 30)
+        self.sym_resistor(xl, ym - 30, xl, ym + 30)
+        self.line(xl, ym + 30, xl, gnd)
+        cv.create_text(xl + 14, ym - 8, text="RL", font=FONT_B, anchor="w")
+        cv.create_text(xl + 14, ym + 8, text=bc.fmt_eng(design.rl, "Ω", 4), font=FONT_S, anchor="w")
+        self.line(x0, gnd, xl, gnd)
+        # ground symbol
+        gx = (x0 + xl) / 2.0
+        self.line(gx, gnd, gx, gnd + 8)
+        for i, hw in enumerate((10, 6, 2)):
+            self.line(gx - hw, gnd + 8 + 3 * i, gx + hw, gnd + 8 + 3 * i)
+        # legend
+        cv.create_text(xl + 70, top, text="青: 理想値", fill=COL_IDEAL, font=FONT_S, anchor="nw")
+        if self.show_rounded:
+            cv.create_text(xl + 70, top + 14, text="赤: E系列値", fill=COL_ROUND, font=FONT_S, anchor="nw")
+        bb = cv.bbox("all")
+        cv.configure(scrollregion=(0, 0, bb[2] + 30, bb[3] + 20))
+
+
+# ==========================================================================
+# frequency response plot
+# ==========================================================================
+def _log_ticks(fmin, fmax):
+    for mults in ([1], [1, 2, 5], list(range(1, 10))):
+        ticks = []
+        d = int(math.floor(math.log10(fmin)))
+        while 10.0 ** d <= fmax * 1.0000001:
+            for m in mults:
+                v = m * 10.0 ** d
+                if fmin * 0.9999999 <= v <= fmax * 1.0000001:
+                    ticks.append(v)
+            d += 1
+        if len(ticks) >= 4:
+            return ticks, mults == [1]
+    # narrow range: linear nice ticks
+    span = fmax - fmin
+    raw = span / 6.0
+    mag = 10.0 ** math.floor(math.log10(raw))
+    step = min((m * mag for m in (1, 2, 5, 10)), key=lambda s: abs(s - raw))
+    v = math.ceil(fmin / step) * step
+    ticks = []
+    while v <= fmax:
+        ticks.append(v)
+        v += step
+    return ticks, False
+
+
+class PlotView(object):
+    ML, MR, MT, MB = 64, 18, 26, 42
+
+    def __init__(self, canvas, status_cb):
+        self.cv = canvas
+        self.data = None
+        self.stopspec = None
+        self.status_cb = status_cb
+        canvas.bind("<Configure>", lambda e: self.redraw())
+        canvas.bind("<Motion>", self.on_motion)
+        canvas.bind("<Leave>", lambda e: self.cv.delete("cursor"))
+
+    def set_data(self, freqs, ideal, rounded, marks, yrange, title, adjusted=None, show_ideal=True):
+        self.data = (freqs, ideal, rounded, marks, yrange, title)
+        self.adjusted = adjusted
+        self.show_ideal = show_ideal
+        self.redraw()
+
+    def geom(self):
+        w = max(self.cv.winfo_width(), 200)
+        h = max(self.cv.winfo_height(), 150)
+        return self.ML, self.MT, w - self.MR, h - self.MB
+
+    def xpix(self, f):
+        x0, y0, x1, y1 = self.geom()
+        fmin, fmax = self.data[0][0], self.data[0][-1]
+        return x0 + (math.log10(f) - math.log10(fmin)) / (math.log10(fmax) - math.log10(fmin)) * (x1 - x0)
+
+    def ypix(self, db):
+        x0, y0, x1, y1 = self.geom()
+        ytop, ybot = self.data[4]
+        db = max(min(db, ytop), ybot)
+        return y0 + (ytop - db) / (ytop - ybot) * (y1 - y0)
+
+    def redraw(self):
+        cv = self.cv
+        cv.delete("all")
+        if not self.data:
+            cv.create_text(cv.winfo_width() / 2, cv.winfo_height() / 2,
+                           text="「設計」を押すと周波数特性を表示します", font=FONT, fill="#888")
+            return
+        freqs, ideal, rounded, marks, (ytop, ybot), title = self.data
+        x0, y0, x1, y1 = self.geom()
+        fmin, fmax = freqs[0], freqs[-1]
+        cv.create_rectangle(x0, y0, x1, y1, outline="#888")
+        # x grid
+        ticks, decades = _log_ticks(fmin, fmax)
+        if decades:
+            d = int(math.floor(math.log10(fmin)))
+            while 10.0 ** d <= fmax:
+                for m in range(2, 10):
+                    v = m * 10.0 ** d
+                    if fmin < v < fmax:
+                        xp = self.xpix(v)
+                        cv.create_line(xp, y0, xp, y1, fill="#eeeeee")
+                d += 1
+        last = -1e9
+        for v in ticks:
+            xp = self.xpix(v)
+            cv.create_line(xp, y0, xp, y1, fill="#d6d6d6")
+            if xp - last >= 62:  # thin out labels that would overlap
+                cv.create_text(xp, y1 + 4, text=bc.fmt_eng(v, "Hz", 4), anchor="n", font=FONT_S)
+                last = xp
+        # y grid
+        span = ytop - ybot
+        step = 20 if span > 90 else 10 if span > 45 else 5 if span > 12 else 1
+        v = math.floor(ytop / step) * step
+        while v >= ybot - 1e-9:
+            yp = self.ypix(v)
+            cv.create_line(x0, yp, x1, yp, fill="#d6d6d6")
+            cv.create_text(x0 - 4, yp, text="%g" % v, anchor="e", font=FONT_S)
+            v -= step
+        cv.create_text(16, (y0 + y1) / 2, text="|S21| [dB]", angle=90, font=FONT_S)
+        cv.create_text((x0 + x1) / 2, y1 + 24, text="周波数（対数軸）", font=FONT_S)
+        cv.create_text(x0, 6, text=title, anchor="nw", font=FONT_S, fill="#444")
+        # markers
+        for f, label, col in marks:
+            if fmin < f < fmax:
+                xp = self.xpix(f)
+                cv.create_line(xp, y0, xp, y1, fill=col, dash=(4, 3))
+                cv.create_text(xp + 3, y0 + 3, text=label, anchor="nw", font=FONT_S, fill=col)
+        # stopband requirement guide (elliptic): -As outside the stopband edges
+        if self.stopspec:
+            fs_lo, fs_hi, a = self.stopspec
+            ya = self.ypix(-a)
+            if fs_lo > fmin:
+                cv.create_line(x0, ya, self.xpix(fs_lo), ya, fill="#8a2a8a", dash=(2, 3))
+            if fs_hi < fmax:
+                cv.create_line(self.xpix(fs_hi), ya, x1, ya, fill="#8a2a8a", dash=(2, 3))
+        # curves: ideal solid, E-series dashed (distinguishable without colour),
+        # adjusted: thick green, drawn on top
+        curves = []
+        if self.show_ideal:
+            curves.append((ideal, COL_IDEAL, None, 1.8, "理想値（実線）"))
+        curves.append((rounded, COL_ROUND, (6, 3), 1.8, "E系列値＝設計値（破線）"))
+        if self.adjusted:
+            curves.append((self.adjusted, COL_ADJ, None, 2.4, "調整後（太線）"))
+        for vals, col, dash, wdt, _ in curves:
+            pts = []
+            for f, d in zip(freqs, vals):
+                pts += [self.xpix(f), self.ypix(d)]
+            cv.create_line(*pts, fill=col, width=wdt, dash=dash)
+        # legend
+        lx, ly = x1 - 200, y1 - 14 - 16 * len(curves)
+        cv.create_rectangle(lx, ly, x1 - 8, y1 - 8, fill="white", outline="#bbb")
+        for i, (vals, col, dash, wdt, label) in enumerate(curves):
+            yy = ly + 12 + 16 * i
+            cv.create_line(lx + 8, yy, lx + 32, yy, fill=col, width=2, dash=dash)
+            cv.create_text(lx + 38, yy, text=label, anchor="w", font=FONT_S)
+
+    def on_motion(self, ev):
+        if not self.data:
+            return
+        x0, y0, x1, y1 = self.geom()
+        self.cv.delete("cursor")
+        if not (x0 <= ev.x <= x1 and y0 <= ev.y <= y1):
+            return
+        freqs, ideal, rounded = self.data[0], self.data[1], self.data[2]
+        fmin, fmax = freqs[0], freqs[-1]
+        lf = math.log10(fmin) + (ev.x - x0) / float(x1 - x0) * (math.log10(fmax) - math.log10(fmin))
+        i = int(round((lf - math.log10(fmin)) / (math.log10(fmax) - math.log10(fmin)) * (len(freqs) - 1)))
+        i = max(0, min(len(freqs) - 1, i))
+        xp = self.xpix(freqs[i])
+        self.cv.create_line(xp, y0, xp, y1, fill="#666", tags="cursor")
+        txt = "%s   理想 %.2f dB   E系列 %.2f dB" % (bc.fmt_eng(freqs[i], "Hz", 5), ideal[i], rounded[i])
+        bw = 256
+        if self.adjusted:
+            txt += "   調整後 %.2f dB (%+.2f)" % (self.adjusted[i], self.adjusted[i] - rounded[i])
+            bw = 400
+        tx = min(max(xp + 6, x0 + 4), x1 - bw - 4)
+        self.cv.create_rectangle(tx - 3, y0 + 20, tx + bw, y0 + 38, fill="#ffffe8",
+                                 outline="#999", tags="cursor")
+        self.cv.create_text(tx, y0 + 29, text=txt, anchor="w", font=FONT_S, tags="cursor")
+
+
+# ==========================================================================
+# main window
+# ==========================================================================
+YRANGES = [("0 ～ -120 dB", (5, -120)), ("0 ～ -80 dB", (5, -80)),
+           ("0 ～ -40 dB", (2, -40)), ("通過域 (+1 ～ -6 dB)", (1, -6))]
+FIRSTS = [("並列共振（シャント）先頭", "shunt"), ("直列共振先頭", "series")]
+
+
+class App(object):
+    def __init__(self, root):
+        self.root = root
         self.design = None
-        self.adj_rows = {}
-        self.v_show_ideal = tk.BooleanVar(value=True)
-        self._build_inputs()
-        self._build_outputs()
+        root.title("LC BPF 設計ツール")
+        root.geometry("1440x900")
+        root.minsize(1000, 650)
+        style = ttk.Style()
+        try:
+            style.theme_use("vista")
+        except tk.TclError:
+            pass
+        style.configure(".", font=FONT)
+        style.configure("Treeview.Heading", font=FONT_B)
 
-    # ------------------------------------------------------------------ 入力
-    def _build_inputs(self):
-        f = ttk.Frame(self, padding=8)
-        f.pack(side=tk.LEFT, fill=tk.Y)
+        main = ttk.Frame(root, padding=6)
+        main.pack(fill="both", expand=True)
+        left = ttk.Frame(main, width=300)
+        left.pack(side="left", fill="y")
+        left.pack_propagate(False)
+        right = ttk.PanedWindow(main, orient="vertical")
+        right.pack(side="left", fill="both", expand=True, padx=(6, 0))
+
+        self.v = {}
+        frm = ttk.LabelFrame(left, text="設計条件", padding=6)
+        frm.pack(fill="x")
         r = 0
 
-        def row(label, widget, unit=None):
+        def row(label):
             nonlocal r
-            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=3)
-            widget.grid(row=r, column=1, sticky="we", pady=3)
-            if unit is not None:
-                unit.grid(row=r, column=2, sticky="w", padx=(4, 0))
+            ttk.Label(frm, text=label).grid(row=r, column=0, sticky="w", pady=2)
             r += 1
+            return r - 1
 
-        self.v_fl = tk.StringVar(value="1")
-        self.v_fh = tk.StringVar(value="2")
-        self.v_unit = tk.StringVar(value="MHz")
-        row("カットオフ周波数 fL", ttk.Entry(f, textvariable=self.v_fl, width=12),
-            ttk.Combobox(f, textvariable=self.v_unit, values=list(UNITS), width=5, state="readonly"))
-        row("カットオフ周波数 fH", ttk.Entry(f, textvariable=self.v_fh, width=12),
-            ttk.Label(f, textvariable=self.v_unit))
-        self.v_n = tk.StringVar(value="5")
-        row("次数（1～20）", ttk.Spinbox(f, from_=1, to=20, textvariable=self.v_n, width=10))
-        self.v_kind = tk.StringVar(value="バタワース")
-        cb = ttk.Combobox(f, textvariable=self.v_kind, values=list(KINDS), state="readonly", width=12)
-        cb.bind("<<ComboboxSelected>>", lambda e: self._update_param_state())
-        row("フィルタ特性", cb)
-        self.v_el = tk.StringVar(value="E12")
-        self.v_ec = tk.StringVar(value="E12")
-        row("L の E 系列", ttk.Combobox(f, textvariable=self.v_el, values=list(core.E_SERIES), state="readonly", width=8))
-        row("C の E 系列", ttk.Combobox(f, textvariable=self.v_ec, values=list(core.E_SERIES), state="readonly", width=8))
-        self.v_r0 = tk.StringVar(value="50")
-        row("入出力インピーダンス", ttk.Entry(f, textvariable=self.v_r0, width=12), ttk.Label(f, text="Ω"))
-        self.v_rip = tk.StringVar(value="0.5")
-        self.e_rip = ttk.Entry(f, textvariable=self.v_rip, width=12)
-        row("リップル", self.e_rip, ttk.Label(f, text="dB"))
-        self.v_as = tk.StringVar(value="40")
-        self.e_as = ttk.Entry(f, textvariable=self.v_as, width=12)
-        row("阻止域減衰量", self.e_as, ttk.Label(f, text="dB"))
-        ttk.Label(f, text="（リップルはチェビシェフ／エリプティック、\n 阻止域減衰量はエリプティックで使用）",
-                  font=FONT_S, foreground="#666").grid(row=r, column=0, columnspan=3, sticky="w")
+        for key, label, default in (("fl", "カットオフ fL（低域側）", "1"),
+                                    ("fh", "カットオフ fH（高域側）", "2")):
+            rr = row(label)
+            self.v[key] = tk.StringVar(value=default)
+            ttk.Entry(frm, textvariable=self.v[key], width=10).grid(row=rr, column=1, sticky="we")
+            self.v[key + "_u"] = tk.StringVar(value="MHz")
+            ttk.Combobox(frm, textvariable=self.v[key + "_u"], values=list(UNITS), width=5,
+                         state="readonly").grid(row=rr, column=2, padx=(3, 0))
+        rr = row("次数（LPF プロトタイプ）")
+        self.v["n"] = tk.StringVar(value="5")
+        ttk.Spinbox(frm, from_=1, to=20, textvariable=self.v["n"], width=8).grid(row=rr, column=1, sticky="we")
+        rr = row("フィルタ特性")
+        self.v["type"] = tk.StringVar(value=bc.TYPES[0])
+        cb = ttk.Combobox(frm, textvariable=self.v["type"], values=list(bc.TYPES), state="readonly", width=13)
+        cb.grid(row=rr, column=1, columnspan=2, sticky="we")
+        cb.bind("<<ComboboxSelected>>", lambda e: self.update_states())
+        rr = row("通過域リップル [dB]")
+        self.v["rip"] = tk.StringVar(value="0.5")
+        self.e_rip = ttk.Entry(frm, textvariable=self.v["rip"], width=10)
+        self.e_rip.grid(row=rr, column=1, sticky="we")
+        rr = row("阻止域減衰量 [dB]")
+        self.v["as"] = tk.StringVar(value="40")
+        self.e_as = ttk.Entry(frm, textvariable=self.v["as"], width=10)
+        self.e_as.grid(row=rr, column=1, sticky="we")
+        rr = row("入出力インピーダンス [Ω]")
+        self.v["r0"] = tk.StringVar(value="50")
+        ttk.Entry(frm, textvariable=self.v["r0"], width=10).grid(row=rr, column=1, sticky="we")
+        rr = row("L の E 系列")
+        self.v["les"] = tk.StringVar(value="E12")
+        ttk.Combobox(frm, textvariable=self.v["les"], values=list(bc.E_SERIES), state="readonly",
+                     width=8).grid(row=rr, column=1, sticky="we")
+        rr = row("C の E 系列")
+        self.v["ces"] = tk.StringVar(value="E12")
+        ttk.Combobox(frm, textvariable=self.v["ces"], values=list(bc.E_SERIES), state="readonly",
+                     width=8).grid(row=rr, column=1, sticky="we")
+        rr = row("回路構成")
+        self.v["first"] = tk.StringVar(value=FIRSTS[0][0])
+        ttk.Combobox(frm, textvariable=self.v["first"], values=[f[0] for f in FIRSTS],
+                     state="readonly", width=18).grid(row=rr + 1, column=0, columnspan=3, sticky="we")
         r += 1
-        ttk.Button(f, text="設計する", command=self.run_design).grid(row=r, column=0, columnspan=3, sticky="we", pady=(10, 4))
-        r += 1
-        ttk.Button(f, text="素子値を CSV 保存", command=self.save_csv).grid(row=r, column=0, columnspan=3, sticky="we")
-        r += 1
-        self.info = tk.Text(f, width=40, height=22, font=FONT, wrap="word", relief="flat", background="#f4f4f4")
-        self.info.grid(row=r, column=0, columnspan=3, sticky="nsew", pady=(10, 0))
-        f.rowconfigure(r, weight=1)
-        self._update_param_state()
+        frm.columnconfigure(1, weight=1)
 
-    def _update_param_state(self):
-        kind = KINDS[self.v_kind.get()]
-        self.e_rip.configure(state="normal" if kind in ("chebyshev", "elliptic") else "disabled")
-        self.e_as.configure(state="normal" if kind == "elliptic" else "disabled")
+        frm2 = ttk.LabelFrame(left, text="表示", padding=6)
+        frm2.pack(fill="x", pady=(6, 0))
+        ttk.Label(frm2, text="表示範囲 fmin / fmax（空欄=自動、単位は fL と同じ）").grid(
+            row=0, column=0, columnspan=3, sticky="w")
+        self.v["pmin"] = tk.StringVar()
+        self.v["pmax"] = tk.StringVar()
+        ttk.Entry(frm2, textvariable=self.v["pmin"], width=10).grid(row=1, column=0, sticky="we")
+        ttk.Label(frm2, text="～").grid(row=1, column=1)
+        ttk.Entry(frm2, textvariable=self.v["pmax"], width=10).grid(row=1, column=2, sticky="we")
+        ttk.Label(frm2, text="縦軸").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.v["yr"] = tk.StringVar(value=YRANGES[0][0])
+        cb = ttk.Combobox(frm2, textvariable=self.v["yr"], values=[y[0] for y in YRANGES],
+                          state="readonly", width=18)
+        cb.grid(row=3, column=0, columnspan=3, sticky="we")
+        cb.bind("<<ComboboxSelected>>", lambda e: self.replot())
+        self.v["showr"] = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frm2, text="回路図に E 系列値を表示", variable=self.v["showr"],
+                        command=self.redraw_circuit).grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.v["showi"] = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frm2, text="理想値の曲線を表示", variable=self.v["showi"],
+                        command=lambda: self.replot(keep=True)).grid(row=5, column=0, columnspan=3, sticky="w")
+        frm2.columnconfigure(0, weight=1)
+        frm2.columnconfigure(2, weight=1)
 
-    # ------------------------------------------------------------------ 出力
-    def _build_outputs(self):
-        nb = ttk.Notebook(self)
-        nb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8), pady=8)
-        tab1 = ttk.Frame(nb)
-        nb.add(tab1, text="回路図・周波数特性")
-        hp = ttk.PanedWindow(tab1, orient=tk.HORIZONTAL)
-        hp.pack(fill=tk.BOTH, expand=True)
-        pw = ttk.PanedWindow(hp, orient=tk.VERTICAL)
-        hp.add(pw, weight=1)
-        hp.add(self._build_adjust_panel(hp), weight=0)
-        cf = ttk.Frame(pw)
-        self.cv = tk.Canvas(cf, background="white", height=320)
-        hs = ttk.Scrollbar(cf, orient=tk.HORIZONTAL, command=self.cv.xview)
-        self.cv.configure(xscrollcommand=hs.set)
-        self.cv.pack(fill=tk.BOTH, expand=True)
-        self._cv_keys = {}
-        self.cv.bind("<MouseWheel>", self._cv_wheel)
-        hs.pack(fill=tk.X)
-        pw.add(cf, weight=1)
-        pf = ttk.Frame(pw)
-        self.pl = tk.Canvas(pf, background="white", height=380)
-        self.pl.pack(fill=tk.BOTH, expand=True)
-        self.pl.bind("<Configure>", lambda e: self.draw_plot())
-        self.pl.bind("<Motion>", self._plot_hover)
-        pw.add(pf, weight=1)
+        bf = ttk.Frame(left)
+        bf.pack(fill="x", pady=8)
+        ttk.Button(bf, text="設計", command=self.run).pack(side="left", fill="x", expand=True)
+        ttk.Button(bf, text="結果をコピー", command=self.copy).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        ttk.Button(bf, text="CSV 保存", command=self.save_csv).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        root.bind("<Return>", lambda e: self.run())
 
-        tab2 = ttk.Frame(nb)
-        nb.add(tab2, text="素子一覧")
-        cols = ("arm", "pos", "elem", "ideal", "eser", "err", "adj", "dev")
-        self.tv = ttk.Treeview(tab2, columns=cols, show="headings")
-        for c, t, w in zip(cols, ("段", "配置", "素子", "理想値", "E 系列値（設計値）", "理想値からの誤差", "調整値", "設計値からのずれ"),
-                           (40, 230, 60, 110, 130, 110, 110, 110)):
-            self.tv.heading(c, text=t)
-            self.tv.column(c, width=w, anchor="w")
-        self.tv.pack(fill=tk.BOTH, expand=True)
+        self.info = tk.Text(left, height=14, font=FONT_S, wrap="word", relief="solid", borderwidth=1)
+        self.info.pack(fill="both", expand=True)
 
-    # ------------------------------------------------------------------ 素子値の調整
-    def _build_adjust_panel(self, parent):
-        outer = ttk.Frame(parent, padding=(6, 4))
-        ttk.Label(outer, text="素子値の調整", font=("Yu Gothic UI", 10, "bold")).pack(anchor="w")
-        ttk.Label(outer, font=FONT_S, foreground="#555", justify="left",
-                  text="◀ ▶: E 系列の前後の標準数へ（L/C それぞれ選択中の系列）\n"
-                       "入力欄: 任意値を入力して Enter（例 330p, 1.2u, 4.7e-9）\n"
-                       "　　　 ↑↓ キーでもステップ変更\n"
-                       "回路図: 素子名クリックで選択、ホイールでステップ").pack(anchor="w", pady=(2, 4))
-        bf = ttk.Frame(outer)
-        bf.pack(fill=tk.X, pady=(0, 4))
-        ttk.Button(bf, text="すべて設計値に戻す", command=self.reset_all).pack(side=tk.LEFT)
-        ttk.Checkbutton(bf, text="理想値の曲線", variable=self.v_show_ideal,
-                        command=self.draw_plot).pack(side=tk.LEFT, padx=(8, 0))
-        self.v_adj_status = tk.StringVar(value="")
-        ttk.Label(outer, textvariable=self.v_adj_status, font=FONT_S, foreground=COL_DEV).pack(anchor="w")
-        wrap = ttk.Frame(outer)
-        wrap.pack(fill=tk.BOTH, expand=True)
-        self.adj_cv = tk.Canvas(wrap, width=340, highlightthickness=0)
-        vs = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=self.adj_cv.yview)
-        self.adj_cv.configure(yscrollcommand=vs.set)
-        vs.pack(side=tk.RIGHT, fill=tk.Y)
-        self.adj_cv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.adj_fr = ttk.Frame(self.adj_cv)
-        self.adj_cv.create_window(0, 0, window=self.adj_fr, anchor="nw")
-        self.adj_fr.bind("<Configure>", lambda e: self.adj_cv.configure(scrollregion=self.adj_cv.bbox("all")))
-        return outer
+        # circuit
+        cf = ttk.LabelFrame(right, text="回路図（梯子型 LC バンドパス）", padding=2)
+        self.ccv = tk.Canvas(cf, background="white", highlightthickness=0)
+        hs = ttk.Scrollbar(cf, orient="horizontal", command=self.ccv.xview)
+        vs = ttk.Scrollbar(cf, orient="vertical", command=self.ccv.yview)
+        self.ccv.configure(xscrollcommand=hs.set, yscrollcommand=vs.set)
+        self.ccv.grid(row=0, column=0, sticky="nsew")
+        vs.grid(row=0, column=1, sticky="ns")
+        hs.grid(row=1, column=0, sticky="ew")
+        cf.rowconfigure(0, weight=1)
+        cf.columnconfigure(0, weight=1)
+        self.ccv.bind("<Shift-MouseWheel>", lambda e: self.ccv.xview_scroll(-int(e.delta / 120), "units"))
+        self.ccv.bind("<MouseWheel>", lambda e: self.circuit.handle_wheel(e)
+                      or self.ccv.yview_scroll(-int(e.delta / 120), "units"))
+        self.circuit = CircuitView(self.ccv, on_wheel=self.step, on_click=self.select_row)
+        right.add(cf, weight=3)
 
-    def _elem_get(self, key):
-        """(調整値, 設計値=E 系列値)"""
-        ai, t, k = key
-        a = self.design.arms[ai]
-        return (a.La if t == "L" else a.Ca)[k], (a.Le if t == "L" else a.Ce)[k]
+        pf = ttk.LabelFrame(right, text="周波数特性（振幅）", padding=2)
+        pcv = tk.Canvas(pf, background="white", highlightthickness=0)
+        pcv.pack(fill="both", expand=True)
+        self.plot = PlotView(pcv, None)
+        right.add(pf, weight=4)
 
-    def _elem_set(self, key, v):
-        ai, t, k = key
-        a = self.design.arms[ai]
-        (a.La if t == "L" else a.Ca)[k] = v
+        nb = ttk.Notebook(right)
+        self.nb = nb
+        # --- adjust tab
+        af = ttk.Frame(nb, padding=2)
+        top = ttk.Frame(af)
+        top.pack(fill="x")
+        ttk.Label(top, text="◀ ▶ / ↑↓キー / 回路図ラベル上のホイールで E系列の前後の値へ。"
+                            "入力欄に任意値（330p, 1.2u など）を入れて Enter。",
+                  font=FONT_S).pack(side="left")
+        ttk.Button(top, text="すべて設計値に戻す", command=self.reset_all).pack(side="right")
+        holder = ttk.Frame(af)
+        holder.pack(fill="both", expand=True, pady=(3, 0))
+        self.acv = tk.Canvas(holder, highlightthickness=0, height=120)
+        asb = ttk.Scrollbar(holder, orient="vertical", command=self.acv.yview)
+        self.acv.configure(yscrollcommand=asb.set)
+        self.acv.pack(side="left", fill="both", expand=True)
+        asb.pack(side="left", fill="y")
+        self.aframe = ttk.Frame(self.acv)
+        self.acv.create_window(0, 0, window=self.aframe, anchor="nw")
+        self.aframe.bind("<Configure>", lambda e: self.acv.configure(scrollregion=self.acv.bbox("all")))
+        self.acv.bind("<MouseWheel>", lambda e: self.acv.yview_scroll(-int(e.delta / 120), "units"))
+        nb.add(af, text="素子値の調整")
+        self.adj_rows = {}
+        # --- element table tab
+        tf = ttk.Frame(nb, padding=2)
+        cols = ("name", "pos", "ideal", "round", "err", "adj", "dev")
+        self.tree = ttk.Treeview(tf, columns=cols, show="headings", height=6)
+        for c, t, w in zip(cols, ("素子", "配置", "理想値", "E系列値", "丸め誤差", "調整値", "設計値からのずれ"),
+                           (60, 70, 130, 120, 80, 120, 110)):
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=w, anchor="center")
+        ts = ttk.Scrollbar(tf, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=ts.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        ts.pack(side="left", fill="y")
+        nb.add(tf, text="素子一覧")
+        right.add(nb, weight=2)
 
-    def _build_adjust_rows(self):
-        for w in self.adj_fr.winfo_children():
+        self.update_states()
+        root.after(100, self.run)
+
+    # ------------------------------------------------------------------
+    def update_states(self):
+        t = self.v["type"].get()
+        self.e_rip.configure(state="normal" if t != "バタワース" else "disabled")
+        self.e_as.configure(state="normal" if t == "エリプティック" else "disabled")
+
+    def _num(self, key, label):
+        s = self.v[key].get().strip()
+        try:
+            return float(s)
+        except ValueError:
+            raise ValueError("%s の値が不正です: '%s'" % (label, s))
+
+    def run(self):
+        try:
+            fl = self._num("fl", "fL") * UNITS[self.v["fl_u"].get()]
+            fh = self._num("fh", "fH") * UNITS[self.v["fh_u"].get()]
+            if fl <= 0 or fh <= 0:
+                raise ValueError("周波数は正の値にしてください")
+            if not fl < fh:
+                raise ValueError("fL < fH となるように入力してください")
+            ns = self.v["n"].get().strip()
+            if not ns.isdigit() or not 1 <= int(ns) <= 20:
+                raise ValueError("次数は 1～20 の整数です")
+            n = int(ns)
+            t = self.v["type"].get()
+            rip = self._num("rip", "リップル")
+            asd = self._num("as", "阻止域減衰量")
+            if t != "バタワース" and rip <= 0:
+                raise ValueError("リップルは正の値にしてください")
+            if t == "エリプティック" and asd <= rip:
+                raise ValueError("阻止域減衰量はリップルより大きくしてください")
+            r0 = self._num("r0", "インピーダンス")
+            if r0 <= 0:
+                raise ValueError("インピーダンスは正の値にしてください")
+            first = dict(FIRSTS)[self.v["first"].get()]
+            self.root.config(cursor="watch")
+            self.root.update_idletasks()
+            d = bc.design_bpf(fl, fh, n, t, r0, rip, asd, self.v["les"].get(), self.v["ces"].get(), first)
+        except (ValueError, bc.SynthesisError) as ex:
+            self.root.config(cursor="")
+            messagebox.showerror("入力エラー", str(ex))
+            return
+        self.root.config(cursor="")
+        self.design = d
+        self.redraw_circuit()
+        self.fill_table()
+        self.build_adjust_panel()
+        self.replot()
+        self.fill_info()
+
+    def redraw_circuit(self):
+        if self.design:
+            self.circuit.show_rounded = self.v["showr"].get()
+            xv = self.ccv.xview()[0]
+            self.circuit.render(self.design)
+            self.ccv.xview_moveto(xv)  # keep the scroll position while adjusting
+
+    def fill_table(self):
+        self.tree.delete(*self.tree.get_children())
+        d = self.design
+        for el in d.elements:
+            u = "H" if el["kind"] == "L" else "F"
+            err = (el["rounded"] / el["ideal"] - 1) * 100
+            adj = el["adjusted"] != el["rounded"]
+            self.tree.insert("", "end", values=(
+                el["name"], el["pos"], bc.fmt_eng(el["ideal"], u, 5), bc.fmt_eng(el["rounded"], u, 3),
+                "%+.1f %%" % err, bc.fmt_eng(el["adjusted"], u, 4) if adj else "―",
+                "%+.1f %%" % ((el["adjusted"] / el["rounded"] - 1) * 100) if adj else "―"))
+
+    # ---- per-element adjustment ----------------------------------------
+    def _el(self, name):
+        for el in self.design.elements:
+            if el["name"] == name:
+                return el
+        return None
+
+    def build_adjust_panel(self):
+        for w in self.aframe.winfo_children():
             w.destroy()
         self.adj_rows = {}
-        for j, h in enumerate(("素子", "設計値", "", "現在値", "", "ずれ")):
-            ttk.Label(self.adj_fr, text=h, font=FONT_S, foreground="#555").grid(row=0, column=j, padx=2)
-        for r, (i, pos, name, unit, v, ve, key) in enumerate(self._elem_rows(), 1):
-            ttk.Label(self.adj_fr, text=name, width=5).grid(row=r, column=0, sticky="w", padx=2)
-            ttk.Label(self.adj_fr, text=core.fmt_eng(ve, unit), width=10, foreground=COL_E).grid(row=r, column=1, sticky="w")
-            bdn = ttk.Button(self.adj_fr, text="◀", width=2, command=lambda k=key: self.step_elem(k, -1))
-            bdn.grid(row=r, column=2)
-            sv = tk.StringVar()
-            en = tk.Entry(self.adj_fr, textvariable=sv, width=11)
-            en.grid(row=r, column=3, padx=1)
-            en.bind("<Return>", lambda e, k=key: self.enter_elem(k))
-            en.bind("<KP_Enter>", lambda e, k=key: self.enter_elem(k))
-            en.bind("<FocusOut>", lambda e, k=key: self._refresh_row(k))
-            en.bind("<Up>", lambda e, k=key: (self.step_elem(k, +1), "break")[1])
-            en.bind("<Down>", lambda e, k=key: (self.step_elem(k, -1), "break")[1])
-            bup = ttk.Button(self.adj_fr, text="▶", width=2, command=lambda k=key: self.step_elem(k, +1))
-            bup.grid(row=r, column=4)
-            dv = tk.StringVar()
-            dl = tk.Label(self.adj_fr, textvariable=dv, width=8, anchor="e", font=FONT)
-            dl.grid(row=r, column=5, padx=2)
-            self.adj_rows[key] = dict(name=name, unit=unit, sv=sv, entry=en, dv=dv, dl=dl, up=bup, down=bdn)
-            self._refresh_row(key)
+        hdr = ("素子", "配置", "設計値（E系列）", "", "現在値", "", "ずれ")
+        for c, t in enumerate(hdr):
+            ttk.Label(self.aframe, text=t, font=FONT_B).grid(row=0, column=c, padx=4, sticky="w")
+        for i, el in enumerate(self.design.elements):
+            u = "H" if el["kind"] == "L" else "F"
+            r = i + 1
+            name = el["name"]
+            ttk.Label(self.aframe, text=name, font=FONT_B).grid(row=r, column=0, padx=4, sticky="w")
+            ttk.Label(self.aframe, text=el["pos"]).grid(row=r, column=1, padx=4, sticky="w")
+            ttk.Label(self.aframe, text="%s  (%s)" % (bc.fmt_eng(el["rounded"], u, 3), el["series"])).grid(
+                row=r, column=2, padx=4, sticky="w")
+            ttk.Button(self.aframe, text="◀", width=3,
+                       command=lambda n=name: self.step(n, -1)).grid(row=r, column=3)
+            var = tk.StringVar(value=bc.fmt_eng(el["adjusted"], u, 4))
+            ent = ttk.Entry(self.aframe, textvariable=var, width=14)
+            ent.grid(row=r, column=4, padx=2)
+            ent.bind("<Return>", lambda e, n=name: (self.set_value(n), "break")[1])
+            ent.bind("<KP_Enter>", lambda e, n=name: (self.set_value(n), "break")[1])
+            ent.bind("<Up>", lambda e, n=name: (self.step(n, 1), "break")[1])
+            ent.bind("<Down>", lambda e, n=name: (self.step(n, -1), "break")[1])
+            ttk.Button(self.aframe, text="▶", width=3,
+                       command=lambda n=name: self.step(n, 1)).grid(row=r, column=5)
+            dev = ttk.Label(self.aframe, text="", width=10)
+            dev.grid(row=r, column=6, padx=4, sticky="w")
+            self.adj_rows[name] = {"var": var, "entry": ent, "dev": dev}
+            for w in self.aframe.grid_slaves(row=r):
+                w.bind("<MouseWheel>", lambda e: self.acv.yview_scroll(-int(e.delta / 120), "units"), add="+")
+            self._update_row(name)
+        self.acv.yview_moveto(0)
 
-    def _refresh_row(self, key):
-        row = self.adj_rows.get(key)
-        if not row or not self.design:
+    def _update_row(self, name):
+        el = self._el(name)
+        row = self.adj_rows.get(name)
+        if not el or not row:
             return
-        va, ve = self._elem_get(key)
-        row["sv"].set(core.fmt_eng(va, row["unit"]))
-        row["dv"].set("±0 %" if va == ve else f"{(va / ve - 1) * 100:+.1f} %")
-        row["dl"].configure(foreground="#777" if va == ve else COL_DEV)
-        row["entry"].configure(foreground="black" if va == ve else COL_DEV)
+        u = "H" if el["kind"] == "L" else "F"
+        row["var"].set(bc.fmt_eng(el["adjusted"], u, 4))
+        if el["adjusted"] != el["rounded"]:
+            row["dev"].configure(text="%+.1f %%" % ((el["adjusted"] / el["rounded"] - 1) * 100), foreground=COL_ADJ)
+        else:
+            row["dev"].configure(text="―", foreground="")
 
-    def step_elem(self, key, steps):
-        if not self.design:
+    def step(self, name, k):
+        el = self._el(name) if self.design else None
+        if not el:
             return
-        series = self.v_el.get() if key[1] == "L" else self.v_ec.get()
-        va, _ = self._elem_get(key)
-        self._elem_set(key, core.step_e(va, series, steps))
-        self._after_adjust(key)
+        el["adjusted"] = bc.step_series(el["adjusted"], el["series"], k)
+        self.after_adjust(name)
 
-    def enter_elem(self, key):
-        row = self.adj_rows[key]
+    def set_value(self, name):
+        el = self._el(name)
+        if not el:
+            return
+        u = "H" if el["kind"] == "L" else "F"
         try:
-            v = core.parse_eng(row["sv"].get(), row["unit"])
+            el["adjusted"] = bc.parse_eng(self.adj_rows[name]["var"].get(), u)
         except ValueError as ex:
-            messagebox.showerror("入力エラー", f"{row['name']}: {ex}")
-            self._refresh_row(key)
+            messagebox.showerror("素子値の入力", str(ex))
+            self._update_row(name)
             return
-        self._elem_set(key, v)
-        self._after_adjust(key)
+        self.after_adjust(name)
 
     def reset_all(self):
         if not self.design:
             return
-        core.reset_adjust(self.design)
-        self._after_adjust(None)
+        bc.reset_adjust(self.design)
+        self.after_adjust(None)
 
-    def select_elem(self, key):
-        row = self.adj_rows.get(key)
-        if row:
-            row["entry"].focus_set()
-            row["entry"].select_range(0, tk.END)
-            self.update_idletasks()
-            h = max(1, self.adj_fr.winfo_height())
-            self.adj_cv.yview_moveto(max(0.0, (row["entry"].winfo_y() - 40) / h))
-
-    def n_adjusted(self):
-        return sum(1 for k in self.adj_rows if self._elem_get(k)[0] != self._elem_get(k)[1])
-
-    def _after_adjust(self, key):
-        self.r_adj = core.response(self.design, self.freqs, use_adj=True)
-        for k in (list(self.adj_rows) if key is None else [key]):
-            self._refresh_row(k)
-        n_adj = self.n_adjusted()
-        self.v_adj_status.set(f"調整中の素子: {n_adj} 個" if n_adj else "")
-        self.fill_info()
-        self.fill_table()
-        self.draw_circuit()
-        self.draw_plot()
-
-    # ------------------------------------------------------------------ 設計
-    def run_design(self):
-        try:
-            u = UNITS[self.v_unit.get()]
-            fl = parse_float(self.v_fl.get(), "fL") * u
-            fh = parse_float(self.v_fh.get(), "fH") * u
-            if fl <= 0 or fh <= 0:
-                raise ValueError("周波数は正の値を入力してください。")
-            if not fl < fh:
-                raise ValueError("fL < fH となるように入力してください。")
-            try:
-                n = int(self.v_n.get())
-            except ValueError:
-                raise ValueError("次数は 1～20 の整数で入力してください。")
-            if not 1 <= n <= 20:
-                raise ValueError("次数は 1～20 の整数で入力してください。")
-            r0 = parse_float(self.v_r0.get(), "インピーダンス")
-            rip = parse_float(self.v_rip.get(), "リップル")
-            asd = parse_float(self.v_as.get(), "阻止域減衰量")
-            kind = KINDS[self.v_kind.get()]
-            self.config(cursor="watch")
-            self.update_idletasks()
-            self.design = core.design_bpf(fl, fh, n, kind, r0, rip, asd, self.v_el.get(), self.v_ec.get())
-        except ValueError as ex:
-            messagebox.showerror("入力エラー", str(ex))
+    def select_row(self, name):
+        row = self.adj_rows.get(name)
+        if not row:
             return
-        finally:
-            self.config(cursor="")
-        self.params = dict(kind=self.v_kind.get(), n=n, rip=rip, asd=asd, kindkey=kind)
-        self._compute_curves()
-        self._build_adjust_rows()
-        self.v_adj_status.set("")
-        self.fill_info()
-        self.fill_table()
-        self.draw_circuit()
-        self.draw_plot()
+        self.nb.select(0)
+        idx = [el["name"] for el in self.design.elements].index(name)
+        n = max(len(self.design.elements), 1)
+        self.acv.yview_moveto(max(0.0, (idx - 1) / float(n + 1)))
+        row["entry"].focus_set()
+        row["entry"].select_range(0, "end")
 
-    def _compute_curves(self):
-        d = self.design
-        span = max(3.0, (d.fh / d.fl) ** 1.5)
-        self.fmin, self.fmax = d.f0 / span, d.f0 * span
-        self.freqs = core.log_freqs(self.fmin, self.fmax, 1201)
-        self.r_ideal = core.response(d, self.freqs, use_e=False)
-        self.r_e = core.response(d, self.freqs, use_e=True)
-        self.r_adj = core.response(d, self.freqs, use_adj=True)
-
-    def _elem_rows(self):
-        """(段, 配置, 素子名, 単位, 理想値, E 系列値, key)。key = (腕 index, 'L'/'C', 腕内 index)"""
-        rows = []
-        for ai, a in enumerate(self.design.arms):
-            i = ai + 1
-            if a.kind in ("series_LC", "shunt_LC"):
-                pos = "直列腕・直列共振" if a.kind == "series_LC" else "並列腕・並列共振"
-                rows += [(i, pos, f"L{i}", "H", a.L[0], a.Le[0], (ai, "L", 0)),
-                         (i, pos, f"C{i}", "F", a.C[0], a.Ce[0], (ai, "C", 0))]
-            else:
-                rows += [(i, "直列腕・(直列LC)∥L∥C の直列枝", f"L{i}a", "H", a.L[0], a.Le[0], (ai, "L", 0)),
-                         (i, "直列腕・(直列LC)∥L∥C の直列枝", f"C{i}a", "F", a.C[0], a.Ce[0], (ai, "C", 0)),
-                         (i, "直列腕・(直列LC)∥L∥C の並列L", f"L{i}b", "H", a.L[1], a.Le[1], (ai, "L", 1)),
-                         (i, "直列腕・(直列LC)∥L∥C の並列C", f"C{i}b", "F", a.C[1], a.Ce[1], (ai, "C", 1))]
-        return rows
-
-    def fill_table(self):
-        self.tv.delete(*self.tv.get_children())
-        for i, pos, name, unit, v, ve, key in self._elem_rows():
-            va = self._elem_get(key)[0]
-            self.tv.insert("", tk.END, values=(i, pos, name, core.fmt_eng(v, unit), core.fmt_eng(ve, unit),
-                                               f"{(ve / v - 1) * 100:+.1f} %", core.fmt_eng(va, unit),
-                                               "±0 %" if va == ve else f"{(va / ve - 1) * 100:+.1f} %"))
-
-    def fill_info(self):
-        d, p = self.design, self.params
-        t = self.info
-        t.configure(state="normal")
-        t.delete("1.0", tk.END)
-        lines = [
-            f"特性: {p['kind']}  {p['n']} 次（素子 {sum(len(a.L) + len(a.C) for a in d.arms)} 個）",
-            f"fL = {core.fmt_eng(d.fl, 'Hz')}, fH = {core.fmt_eng(d.fh, 'Hz')}",
-            f"中心周波数 f0 = √(fL·fH) = {core.fmt_eng(d.f0, 'Hz')}",
-            f"帯域幅 BW = {core.fmt_eng(d.fh - d.fl, 'Hz')}（比帯域 {(d.fh - d.fl) / d.f0 * 100:.1f} %）",
-            f"信号源 R = {d.r0:g} Ω、負荷 R = {d.rl:.4g} Ω",
-        ]
-        if p["kindkey"] == "butterworth":
-            lines.append("fL/fH は −3 dB 点です。")
+    def after_adjust(self, name):
+        if name:
+            self._update_row(name)
         else:
-            lines.append(f"fL/fH はリップル {p['rip']:g} dB の通過域端です。")
-        if p["kindkey"] == "elliptic" and d.fs_lo:
-            lines.append(f"阻止域減衰量 {p['asd']:g} dB の阻止域端: {core.fmt_eng(d.fs_lo, 'Hz')} 以下 / "
-                         f"{core.fmt_eng(d.fs_hi, 'Hz')} 以上")
-        if d.note:
-            lines.append("注: " + d.note)
-        lines.append("")
-        lines.append("低域プロトタイプ（正規化値）:")
-        gi = 1
-        for e in d.proto.elements:
-            if e[0] == "LCtank":
-                lines.append(f"  g{gi}: 直列腕タンク L={e[1]:.5f}, C={e[2]:.5f}")
-            else:
-                lines.append(f"  g{gi} = {e[1]:.5f}（{'シャント C' if e[0] == 'C' else '直列 L'}）")
-            gi += 1
-        lines.append(f"  負荷 = {d.proto.rl:.5f}")
-        # E 系列の影響
-        pb = [(f, a, b) for f, a, b in zip(self.freqs, self.r_ideal, self.r_e) if d.fl <= f <= d.fh]
-        if pb:
-            lines.append("")
-            lines.append("通過域内の挿入損失（最大）: 理想 %.2f dB / E系列 %.2f dB"
-                         % (-min(x[1] for x in pb), -min(x[2] for x in pb)))
-            if core.is_adjusted(d):
-                pa = [b for f, b in zip(self.freqs, self.r_adj) if d.fl <= f <= d.fh]
-                dmax = max(abs(a - b) for a, b in zip(self.r_e, self.r_adj))
-                lines.append("　調整後: %.2f dB（設計値の特性との差 最大 %.2f dB）" % (-min(pa), dmax))
-        t.insert("1.0", "\n".join(lines))
-        t.configure(state="disabled")
+            for n in self.adj_rows:
+                self._update_row(n)
+        self.redraw_circuit()
+        self.fill_table()
+        self.replot(keep=True)
+        self.fill_info()
 
-    def save_csv(self):
-        if not self.design:
-            messagebox.showinfo("CSV 保存", "先に設計してください。")
-            return
-        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")],
-                                            initialfile="lc_bpf_elements.csv")
-        if not path:
-            return
-        with open(path, "w", newline="", encoding="utf-8-sig") as fp:
-            w = csv.writer(fp)
-            w.writerow(["段", "配置", "素子", "単位", "理想値", "E系列値", "調整値", "設計値からのずれ[%]"])
-            for i, pos, name, unit, v, ve, key in self._elem_rows():
-                va = self._elem_get(key)[0]
-                w.writerow([i, pos, name, unit, f"{v:.6e}", f"{ve:.6e}", f"{va:.6e}", f"{(va / ve - 1) * 100:+.2f}"])
+    def freq_range(self):
+        d = self.design
+        bw = d.fh - d.fl
+        fmin = max(d.fl - 1.5 * bw, d.fl / 4.0)
+        fmax = min(d.fh + 1.5 * bw, d.fh * 4.0)
+        mul = UNITS[self.v["fl_u"].get()]
+        try:
+            if self.v["pmin"].get().strip():
+                fmin = float(self.v["pmin"].get()) * mul
+            if self.v["pmax"].get().strip():
+                fmax = float(self.v["pmax"].get()) * mul
+        except ValueError:
+            messagebox.showwarning("表示範囲", "表示範囲の値が不正なので自動範囲を使います")
+        if not (0 < fmin < fmax):
+            fmin, fmax = d.fl / 4.0, d.fh * 4.0
+        return fmin, fmax
 
-    # ------------------------------------------------------------------ 回路図
-    def _ind_h(self, x0, x1, y):
-        """水平インダクタ（x0→x1）"""
-        c = self.cv
-        n = 4
-        w = (x1 - x0) / n
-        for i in range(n):
-            c.create_arc(x0 + i * w, y - w / 2, x0 + (i + 1) * w, y + w / 2, start=0, extent=180, style="arc", width=1.5)
-
-    def _ind_v(self, x, y0, y1):
-        c = self.cv
-        n = 4
-        h = (y1 - y0) / n
-        for i in range(n):
-            c.create_arc(x - h / 2, y0 + i * h, x + h / 2, y0 + (i + 1) * h, start=90, extent=-180, style="arc", width=1.5)
-
-    def _cap_h(self, xm, y):
-        c = self.cv
-        c.create_line(xm - 4, y - 10, xm - 4, y + 10, width=2)
-        c.create_line(xm + 4, y - 10, xm + 4, y + 10, width=2)
-
-    def _cap_v(self, x, ym):
-        c = self.cv
-        c.create_line(x - 10, ym - 4, x + 10, ym - 4, width=2)
-        c.create_line(x - 10, ym + 4, x + 10, ym + 4, width=2)
-
-    def _res_v(self, x, y0, y1):
-        c = self.cv
-        pts = [x, y0]
-        n = 6
-        h = (y1 - y0) / n
-        for i in range(n):
-            pts += [x + (7 if i % 2 == 0 else -7), y0 + (i + 0.5) * h]
-        pts += [x, y1]
-        c.create_line(*pts, width=1.5)
-
-    def _lbl(self, x, y, name, v, ve, unit, anchor="n", key=None):
-        c = self.cv
-        tag = f"el_{key[0]}_{key[1]}_{key[2]}" if key else ""
-        tags = ("elem", tag) if key else ()
-        c.create_text(x, y, text=f"{name}  {core.fmt_eng(v, unit)}", font=FONT_S, fill=COL_IDEAL, anchor=anchor, tags=tags)
-        c.create_text(x, y + 12, text=f"({core.fmt_eng(ve, unit)})", font=FONT_S, fill=COL_E, anchor=anchor, tags=tags)
-        if key:
-            va = self._elem_get(key)[0]
-            if va != ve:
-                c.create_text(x, y + 24, text=f"→{core.fmt_eng(va, unit)} {(va / ve - 1) * 100:+.1f}%",
-                              font=FONT_S, fill=COL_DEV, anchor=anchor, tags=tags)
-            c.tag_bind(tag, "<Button-1>", lambda e, k=key: self.select_elem(k))
-            self._cv_keys[tag] = key
-            c.tag_bind(tag, "<Enter>", lambda e: c.configure(cursor="hand2"))
-            c.tag_bind(tag, "<Leave>", lambda e: c.configure(cursor=""))
-
-    def draw_circuit(self):
-        c = self.cv
-        c.delete("all")
-        self._cv_keys = {}
+    def replot(self, keep=False):
         d = self.design
         if not d:
             return
-        yt, yb = 150, 270
-        x = 20
-        # 信号源
-        c.create_oval(x, (yt + yb) / 2 - 15, x + 30, (yt + yb) / 2 + 15, width=1.5)
-        c.create_text(x + 15, (yt + yb) / 2, text="~")
-        c.create_line(x + 15, yt, x + 15, (yt + yb) / 2 - 15, width=1.5)
-        c.create_line(x + 15, yb, x + 15, (yt + yb) / 2 + 15, width=1.5)
-        c.create_line(x + 15, yt, x + 30, yt, width=1.5)
-        x += 30
-        # 信号源抵抗（水平）
-        pts = [x, yt]
-        for i in range(6):
-            pts += [x + 5 + i * 6, yt + (7 if i % 2 == 0 else -7)]
-        pts += [x + 40, yt]
-        c.create_line(*pts, width=1.5)
-        c.create_text(x + 20, yt - 22, text=f"Rs {d.r0:g} Ω", font=FONT_S)
-        x += 40
-        xs = 35
-        for i, a in enumerate(d.arms, 1):
-            if a.kind == "series_LC":
-                w = 150
-                c.create_line(x, yt, x + 20, yt, width=1.5)
-                self._ind_h(x + 20, x + 70, yt)
-                c.create_line(x + 70, yt, x + 96, yt, width=1.5)
-                self._cap_h(x + 100, yt)
-                c.create_line(x + 104, yt, x + w, yt, width=1.5)
-                self._lbl(x + 45, yt - 56, f"L{i}", a.L[0], a.Le[0], "H", key=(i - 1, "L", 0))
-                self._lbl(x + 105, yt + 16, f"C{i}", a.C[0], a.Ce[0], "F", key=(i - 1, "C", 0))
-            elif a.kind == "shunt_LC":
-                w = 150
-                c.create_line(x, yt, x + w, yt, width=1.5)
-                xl, xc = x + 45, x + 105
-                c.create_oval(xl - 2, yt - 2, xl + 2, yt + 2, fill="black")
-                c.create_oval(xc - 2, yt - 2, xc + 2, yt + 2, fill="black")
-                c.create_line(xl, yt, xl, yt + 30, width=1.5)
-                self._ind_v(xl, yt + 30, yt + 90)
-                c.create_line(xl, yt + 90, xl, yb, width=1.5)
-                c.create_line(xc, yt, xc, yt + 56, width=1.5)
-                self._cap_v(xc, yt + 60)
-                c.create_line(xc, yt + 64, xc, yb, width=1.5)
-                c.create_oval(xl - 2, yb - 2, xl + 2, yb + 2, fill="black")
-                c.create_oval(xc - 2, yb - 2, xc + 2, yb + 2, fill="black")
-                self._lbl(xl - 6, yb + 8, f"L{i}", a.L[0], a.Le[0], "H", anchor="ne", key=(i - 1, "L", 0))
-                self._lbl(xc + 6, yb + 8, f"C{i}", a.C[0], a.Ce[0], "F", anchor="nw", key=(i - 1, "C", 0))
-            else:
-                w = 200
-                xa, xb = x + 20, x + w - 20
-                c.create_line(x, yt, xa, yt, width=1.5)
-                c.create_line(xb, yt, x + w, yt, width=1.5)
-                c.create_line(xa, yt - 80, xa, yt, width=1.5)
-                c.create_line(xb, yt - 80, xb, yt, width=1.5)
-                # 枝1（最上段）: 直列 L-C
-                y1 = yt - 80
-                c.create_line(xa, y1, xa + 20, y1, width=1.5)
-                self._ind_h(xa + 20, xa + 70, y1)
-                c.create_line(xa + 70, y1, xa + 106, y1, width=1.5)
-                self._cap_h(xa + 110, y1)
-                c.create_line(xa + 114, y1, xb, y1, width=1.5)
-                # 枝2: L
-                y2 = yt - 40
-                c.create_line(xa, y2, xa + 55, y2, width=1.5)
-                self._ind_h(xa + 55, xa + 105, y2)
-                c.create_line(xa + 105, y2, xb, y2, width=1.5)
-                # 枝3（レール上）: C
-                c.create_line(xa, yt, xa + 76, yt, width=1.5)
-                self._cap_h(xa + 80, yt)
-                c.create_line(xa + 84, yt, xb, yt, width=1.5)
-                self._lbl(xa + 45, y1 - 46, f"L{i}a", a.L[0], a.Le[0], "H", key=(i - 1, "L", 0))
-                self._lbl(xa + 125, y1 - 46, f"C{i}a", a.C[0], a.Ce[0], "F", key=(i - 1, "C", 0))
-                self._lbl(xa + 80, yt + 16, f"L{i}b", a.L[1], a.Le[1], "H", key=(i - 1, "L", 1))
-                self._lbl(xa + 80, yt + 56, f"C{i}b", a.C[1], a.Ce[1], "F", key=(i - 1, "C", 1))
-            x += w
-        # 負荷
-        c.create_line(x, yt, x + 30, yt, width=1.5)
-        c.create_line(x + 30, yt, x + 30, yt + 40, width=1.5)
-        self._res_v(x + 30, yt + 40, yt + 90)
-        c.create_line(x + 30, yt + 90, x + 30, yb, width=1.5)
-        c.create_text(x + 40, yt + 65, text=f"RL {d.rl:.4g} Ω", font=FONT_S, anchor="w")
-        x += 30
-        c.create_line(xs, yb, x, yb, width=1.5)
-        c.create_text(20, 12, anchor="nw", font=FONT,
-                      text="青: 理想値　橙(括弧内): E 系列値＝設計値（L: %s / C: %s）　赤(→): 調整値と設計値からのずれ"
-                      % (self.v_el.get(), self.v_ec.get()))
-        c.configure(scrollregion=(0, 0, x + 120, yb + 50))
+        if keep and getattr(self, "_resp", None) and self._resp[3] is d:
+            freqs, ideal, rounded = self._resp[:3]   # only the adjusted curve changes
+        else:
+            fmin, fmax = self.freq_range()
+            N = 1601
+            la, lb = math.log10(fmin), math.log10(fmax)
+            freqs = [10 ** (la + (lb - la) * i / (N - 1)) for i in range(N)]
+            ideal = bc.response_db(d, freqs, False)
+            rounded = bc.response_db(d, freqs, True)
+            self._resp = (freqs, ideal, rounded, d)
+        adjusted = bc.response_db(d, freqs, "adjusted") if bc.is_adjusted(d) else None
+        marks = [(d.fl, "fL", "#2a8a2a"), (d.fh, "fH", "#2a8a2a")]
+        self.plot.stopspec = None
+        if d.stop_edges:
+            marks += [(d.stop_edges[0], "fs-", "#8a2a8a"), (d.stop_edges[1], "fs+", "#8a2a8a")]
+            self.plot.stopspec = (d.stop_edges[0], d.stop_edges[1], d.as_db)
+        title = "%s %d次  fL=%s  fH=%s  R0=%s  L:%s C:%s" % (
+            d.ftype, d.order, bc.fmt_eng(d.fl, "Hz", 4), bc.fmt_eng(d.fh, "Hz", 4),
+            bc.fmt_eng(d.r0, "Ω", 4), d.l_series, d.c_series)
+        self.plot.set_data(freqs, ideal, rounded, marks, dict(YRANGES)[self.v["yr"].get()], title,
+                           adjusted=adjusted, show_ideal=self.v["showi"].get())
 
-    # ------------------------------------------------------------------ 周波数特性
-    def draw_plot(self):
-        c = self.pl
-        c.delete("all")
-        if not self.design:
-            c.create_text(20, 20, anchor="nw", text="左の入力欄を設定して「設計する」を押してください。", font=FONT)
-            return
-        W, H = c.winfo_width(), c.winfo_height()
-        ml, mr, mt, mb = 60, 20, 44, 40
-        self._pa = (ml, mt, W - mr, H - mb)
-        lo = min(min(self.r_ideal), min(self.r_e), min(self.r_adj))
-        ymin = max(-120.0, math.floor(lo / 10) * 10)
-        ymin = min(ymin, -60.0)
-        ymax = 5.0
-        lx0, lx1 = math.log10(self.fmin), math.log10(self.fmax)
-        self._ax = (lx0, lx1, ymin, ymax)
-
-        def X(f):
-            return ml + (math.log10(f) - lx0) / (lx1 - lx0) * (W - ml - mr)
-
-        def Y(db):
-            db = max(ymin, min(ymax, db))
-            return mt + (ymax - db) / (ymax - ymin) * (H - mt - mb)
-
-        # グリッド
-        for dec in range(math.floor(lx0), math.ceil(lx1) + 1):
-            for m in range(1, 10):
-                f = m * 10 ** dec
-                if self.fmin <= f <= self.fmax:
-                    c.create_line(X(f), mt, X(f), H - mb, fill="#ddd" if m != 1 else "#bbb")
-                    if m in (1, 2, 5):
-                        c.create_text(X(f), H - mb + 4, text=core.fmt_eng(f, "Hz").replace(" ", ""), anchor="n", font=FONT_S)
-        step = 10 if ymax - ymin <= 80 else 20
-        db = 0
-        while db >= ymin:
-            c.create_line(ml, Y(db), W - mr, Y(db), fill="#bbb" if db == 0 else "#ddd")
-            c.create_text(ml - 4, Y(db), text=f"{db}", anchor="e", font=FONT_S)
-            db -= step
-        c.create_rectangle(ml, mt, W - mr, H - mb, outline="#888")
-        c.create_text(14, (mt + H - mb) / 2, text="|S21| [dB]", angle=90, font=FONT_S)
-        c.create_text((ml + W - mr) / 2, H - 14, text="周波数（対数軸）", font=FONT_S)
+    def info_text(self):
         d = self.design
-        for f, lab in ((d.fl, "fL"), (d.fh, "fH")):
-            c.create_line(X(f), mt, X(f), H - mb, fill="#5a5", dash=(4, 3))
-            c.create_text(X(f) + 3, mt + 3, text=lab, anchor="nw", fill="#383", font=FONT_S)
-        if self.params["kindkey"] == "elliptic" and d.fs_lo:
-            a = -self.params["asd"]
-            c.create_line(ml, Y(a), X(d.fs_lo), Y(a), fill="#a5a", dash=(2, 3))
-            c.create_line(X(d.fs_hi), Y(a), W - mr, Y(a), fill="#a5a", dash=(2, 3))
-        # 曲線
-        adjusted = core.is_adjusted(d)
-        curves = []
-        if self.v_show_ideal.get():
-            curves.append((self.r_ideal, COL_IDEAL, None, 1.5))
-        if adjusted:
-            curves.append((self.r_adj, COL_ADJ, None, 2.5))
-        curves.append((self.r_e, COL_E, (6, 3), 2))
-        for data, col, dash, width in curves:
-            pts = []
-            for f, v in zip(self.freqs, data):
-                pts += [X(f), Y(v)]
-            c.create_line(*pts, fill=col, width=width, dash=dash)
-        # 凡例
-        # 凡例（プロット枠の外、タイトルの下の1行）
-        lx, ly = ml, mt - 12
-        items = []
-        if self.v_show_ideal.get():
-            items.append((COL_IDEAL, None, 2, "理想値"))
-        items.append((COL_E, (6, 3), 2, f"設計値＝E 系列（L:{self.v_el.get()} C:{self.v_ec.get()}）"))
-        items.append((COL_ADJ, None, 2.5, "調整後" + ("" if adjusted else "（未調整：設計値と同じ）")))
-        for col, dash, width, label in items:
-            c.create_line(lx, ly, lx + 28, ly, fill=col, width=width, dash=dash)
-            t = c.create_text(lx + 33, ly, text=label, anchor="w", font=FONT_S)
-            lx = c.bbox(t)[2] + 18
-        c.create_text(ml, 4, anchor="nw", font=FONT, text="振幅特性 |S21|（Rs・RL 終端の伝達利得）")
-        self._hover_id = None
+        L = []
+        L.append("特性: %s  次数: %d" % (d.ftype, d.order))
+        if d.ftype != "バタワース":
+            L.append("通過域リップル: %g dB" % d.ripple_db)
+        if d.ftype == "エリプティック":
+            L.append("阻止域減衰量: %g dB" % d.as_db)
+        L.append("fL/fH の定義: " + ("-3 dB 点" if d.ftype == "バタワース" else "リップル通過域の端"))
+        L.append("中心周波数 f0 = √(fL·fH) = %s" % bc.fmt_eng(d.f0, "Hz", 5))
+        L.append("帯域幅 = %s（比帯域 %.3g %%）" % (bc.fmt_eng(d.fh - d.fl, "Hz", 5), (d.fh - d.fl) / d.f0 * 100))
+        L.append("Rs = %s, RL = %s" % (bc.fmt_eng(d.rs, "Ω", 5), bc.fmt_eng(d.rl, "Ω", 5)))
+        if abs(d.rl - d.rs) > 1e-6 * d.rs:
+            L.append("※ 偶数次チェビシェフは終端抵抗が等しくなりません（RL は上記の値）。")
+        if d.stop_edges:
+            L.append("阻止域端（%g dB 到達）: %s / %s" % (d.as_db, bc.fmt_eng(d.stop_edges[0], "Hz", 5),
+                                                     bc.fmt_eng(d.stop_edges[1], "Hz", 5)))
+            L.append("LPF 正規化阻止域端 Ωs = %.6g" % d.info["ws"])
+            L.append("合成検証誤差（目標特性との差）: %.2g dB" % d.info["synth_err_db"])
+            if d.order % 2 == 0:
+                L.append("※ 偶数次は等終端にするため type c 変形（伝送零点1組を∞へ移動）を使用。")
+            if d.order >= 9:
+                L.append("※ 高次エリプティックは素子感度が非常に高く、E系列に丸めると特性が大きく崩れます。")
+        if "g" in d.info:
+            L.append("g 値: " + ", ".join("%.5g" % g for g in d.info["g"]))
+        if hasattr(self, "_resp"):
+            vals = bc.response_db(d, [d.fl, d.f0, d.fh], False)
+            valr = bc.response_db(d, [d.fl, d.f0, d.fh], True)
+            L.append("")
+            L.append("|S21| [dB]      fL       f0       fH")
+            L.append("  理想値     %7.2f  %7.2f  %7.2f" % tuple(vals))
+            L.append("  E系列値    %7.2f  %7.2f  %7.2f" % tuple(valr))
+            if bc.is_adjusted(d):
+                vala = bc.response_db(d, [d.fl, d.f0, d.fh], "adjusted")
+                L.append("  調整後     %7.2f  %7.2f  %7.2f" % tuple(vala))
+                L.append("調整中の素子: " + ", ".join(el["name"] for el in d.elements
+                                                    if el["adjusted"] != el["rounded"]))
+        return "\n".join(L)
 
-    def _cv_wheel(self, ev):
-        """回路図の素子ラベル上でホイール → その素子を 1 ステップ変更"""
-        for item in self.cv.find_withtag("current"):
-            for t in self.cv.gettags(item):
-                if t in self._cv_keys:
-                    self.step_elem(self._cv_keys[t], 1 if ev.delta > 0 else -1)
-                    return "break"
+    def fill_info(self):
+        self.info.configure(state="normal")
+        self.info.delete("1.0", "end")
+        self.info.insert("1.0", self.info_text())
+        self.info.configure(state="disabled")
 
-    def _key_by_name(self, name):
-        for row in self._elem_rows():
-            if row[2] == name:
-                return row[6]
-        raise KeyError(name)
-
-    def apply_adjust_spec(self, spec):
-        for item in spec.split(","):
-            name, st = item.split("=")
-            self.step_elem(self._key_by_name(name.strip()), int(st))
-
-    def autocheck(self, out):
-        import json
-        rep = {"ok": False}
-        try:
-            d = self.design
-            rows = self._elem_rows()
-            caps = [r for r in rows if r[3] == "F"]
-            base = list(self.r_adj)
-            rep["design"] = dict(fl=d.fl, fh=d.fh, n=len(d.arms), L_series=self.v_el.get(), C_series=self.v_ec.get(), r0=d.r0)
-            rep["base_equals_design"] = base == self.r_e
-            checks = []
-            for r in caps:
-                key, name = r[6], r[2]
-                ve = r[5]
-                self.adj_rows[key]["up"].invoke()  # ▶ ボタン = 1 ステップ増
-                self.update()
-                va = self._elem_get(key)[0]
-                diff = max(abs(a - b) for a, b in zip(self.r_adj, self.r_e))
-                shown = self.adj_rows[key]["dv"].get()
-                self.reset_all()
-                self.update()
-                back = self._elem_get(key)[0] == ve and self.r_adj == self.r_e and not core.is_adjusted(d)
-                checks.append(dict(name=name, design=ve, stepped=va, shown_dev=shown,
-                                   max_dB_change=round(diff, 4), reset_ok=back))
-            # ▶ ボタン相当と任意値入力
-            k0 = caps[0][6]
-            self.adj_rows[k0]["down"].invoke()
-            down = self._elem_get(k0)[0]
-            self.reset_all()
-            en = self.adj_rows[k0]["entry"]
-            self.focus_force()
-            en.focus_force()
-            self.update()
-            en.event_generate("<Up>")
-            self.update()
-            rep["C1_up_key"] = self._elem_get(k0)[0]
-            self.adj_rows[k0]["sv"].set("123.4p")
-            en.event_generate("<Return>")
-            self.update()
-            typed = self._elem_get(k0)[0]
-            self.adj_rows[k0]["up"].invoke()
-            typed_up = self._elem_get(k0)[0]
-            lk = [r for r in rows if r[3] == "H"][0][6]
-            self.adj_rows[lk]["up"].invoke()
-            rep["L1_step_up"] = [self._elem_get(lk)[1], self._elem_get(lk)[0]]
-            rep["circuit_shows_adjusted"] = any("→" in self.cv.itemcget(i, "text") for i in self.cv.find_withtag("elem"))
-            rep["table_dev_col"] = [self.tv.item(i, "values")[7] for i in self.tv.get_children()]
-            n_adj = self.n_adjusted()
-            self.reset_all()
-            rep["C1_step_down"] = down
-            rep["C1_typed_123.4p"] = typed
-            rep["C1_typed_then_step_up"] = typed_up
-            rep["n_adjusted_before_reset"] = n_adj
-            rep["after_reset_adjusted"] = core.is_adjusted(d)
-            rep["caps"] = checks
-            rep["ok"] = (rep["base_equals_design"] and all(c["max_dB_change"] > 0.01 and c["reset_ok"] for c in checks)
-                         and abs(typed - 123.4e-12) < 1e-18 and not core.is_adjusted(d))
-        except Exception as ex:  # noqa: BLE001
-            rep["error"] = repr(ex)
-        with open(out, "w", encoding="utf-8") as fp:
-            json.dump(rep, fp, ensure_ascii=False, indent=1)
-        self.destroy()
-
-    def _plot_hover(self, ev):
-        if not self.design or not hasattr(self, "_pa"):
+    def copy(self):
+        if not self.design:
             return
-        x0, y0, x1, y1 = self._pa
-        c = self.pl
-        c.delete("hover")
-        if not (x0 <= ev.x <= x1 and y0 <= ev.y <= y1):
+        lines = [self.info_text(), "", "素子\t配置\t理想値\tE系列値\t調整値"]
+        for el in self.design.elements:
+            u = "H" if el["kind"] == "L" else "F"
+            lines.append("%s\t%s\t%s\t%s\t%s" % (el["name"], el["pos"], bc.fmt_eng(el["ideal"], u, 5),
+                                                 bc.fmt_eng(el["rounded"], u, 3), bc.fmt_eng(el["adjusted"], u, 4)))
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(lines))
+        messagebox.showinfo("コピー", "設計結果をクリップボードにコピーしました")
+
+    def save_csv(self):
+        d = self.design
+        if not d:
+            messagebox.showinfo("CSV 保存", "先に設計してください。")
             return
-        lx0, lx1, _, _ = self._ax
-        f = 10 ** (lx0 + (ev.x - x0) / (x1 - x0) * (lx1 - lx0))
-        a = core.response(self.design, [f])[0]
-        b = core.response(self.design, [f], use_e=True)[0]
-        txt = f"{core.fmt_eng(f, 'Hz')}\n理想 {a:.2f} dB / 設計値 {b:.2f} dB"
-        if core.is_adjusted(self.design):
-            g = core.response(self.design, [f], use_adj=True)[0]
-            txt += f"\n調整後 {g:.2f} dB（{g - b:+.2f} dB）"
-        c.create_line(ev.x, y0, ev.x, y1, fill="#999", tags="hover")
-        c.create_text(ev.x + 6, y1 - 6, anchor="sw", font=FONT_S, tags="hover", text=txt)
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", filetypes=[("CSV", "*.csv")],
+            initialfile="lc_bpf_%s_%d.csv" % ({"バタワース": "butterworth", "チェビシェフ": "chebyshev",
+                                                "エリプティック": "elliptic"}[d.ftype], d.order))
+        if not path:
+            return
+        # utf-8-sig so that Excel opens the Japanese headers correctly
+        with open(path, "w", newline="", encoding="utf-8-sig") as fp:
+            w = csv.writer(fp)
+            w.writerow(["# %s %d次 fL=%g Hz fH=%g Hz Rs=%g ohm RL=%g ohm L:%s C:%s" % (
+                d.ftype, d.order, d.fl, d.fh, d.rs, d.rl, d.l_series, d.c_series)])
+            w.writerow(["素子", "配置", "種類", "理想値", "E系列値", "単位", "丸め誤差[%]",
+                        "調整値", "設計値からのずれ[%]"])
+            for el in d.elements:
+                w.writerow([el["name"], el["pos"], el["kind"], "%.6g" % el["ideal"], "%.4g" % el["rounded"],
+                            "H" if el["kind"] == "L" else "F",
+                            "%.2f" % ((el["rounded"] / el["ideal"] - 1) * 100),
+                            "%.6g" % el["adjusted"], "%.2f" % ((el["adjusted"] / el["rounded"] - 1) * 100)])
+        messagebox.showinfo("CSV 保存", "保存しました:\n%s" % path)
 
 
 def main():
-    app = App()
-    if "--demo" in sys.argv:  # 動作確認用: --demo [butterworth|chebyshev|elliptic] [次数]
-        rest = sys.argv[sys.argv.index("--demo") + 1:]
-        inv = {v: k for k, v in KINDS.items()}
-        if rest and rest[0] in inv:
-            app.v_kind.set(inv[rest[0]])
-            app._update_param_state()
-        if len(rest) > 1:
-            app.v_n.set(rest[1])
-        app.after(300, app.run_design)
-    if "--adjust" in sys.argv:  # 例: --adjust C1=+1,L3=-2（--demo と併用、スクリーンショット用）
-        spec = sys.argv[sys.argv.index("--adjust") + 1]
-        app.after(900, lambda: app.apply_adjust_spec(spec))
-    if "--autocheck" in sys.argv:  # 動作確認: 調整→リセットを GUI のハンドラ経由で行い結果を書き出して終了
-        out = sys.argv[sys.argv.index("--autocheck") + 1]
-        app.after(1500, lambda: app.autocheck(out))
-    app.mainloop()
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+    root = tk.Tk()
+    app = App(root)
+    # --demo [butterworth|chebyshev|elliptic] [order]: start with that design
+    argv = sys.argv[1:]
+    if "--demo" in argv:
+        rest = argv[argv.index("--demo") + 1:]
+        names = {"butterworth": "バタワース", "chebyshev": "チェビシェフ", "elliptic": "エリプティック"}
+        if rest and rest[0] in names:
+            app.v["type"].set(names[rest[0]])
+            rest = rest[1:]
+        if rest and rest[0].isdigit():
+            app.v["n"].set(rest[0])
+    # optional presets: key=value (fl, fh, n, type, rip, as, r0, les, ces, first, yr)
+    for arg in argv:
+        if "=" in arg:
+            k, val = arg.split("=", 1)
+            if k == "first":
+                val = FIRSTS[1][0] if val == "series" else FIRSTS[0][0]
+            elif k == "yr":
+                val = YRANGES[int(val)][0]
+            if k in app.v:
+                app.v[k].set(val)
+    app.update_states()
+    # --adjust C3=+1,L2=-1: step those elements after the first design
+    if "--adjust" in argv and argv.index("--adjust") + 1 < len(argv):
+        spec = argv[argv.index("--adjust") + 1]
+
+        def apply_adjust():
+            for item in spec.split(","):
+                if "=" in item:
+                    name, k = item.split("=", 1)
+                    try:
+                        app.step(name.strip(), int(k))
+                    except ValueError:
+                        pass
+        root.after(400, apply_adjust)
+    # --autocheck result.json: exercise the GUI handlers, write the result, quit
+    if "--autocheck" in argv and argv.index("--autocheck") + 1 < len(argv):
+        out = argv[argv.index("--autocheck") + 1]
+        root.after(600, lambda: _autocheck(app, out))
+    if len(sys.argv) > 2 and sys.argv[1] == "--screenshot":
+        root.after(2500, lambda: _shot(root, sys.argv[2]))
+    root.mainloop()
+
+
+def _autocheck(app, out):
+    """GUI self-check through the real event handlers (works in the exe too)."""
+    import json
+    res = {}
+    root = app.root
+    try:
+        d = app.design
+        res["designed"] = d is not None
+        caps = [el for el in d.elements if el["kind"] == "C"]
+        # 1) every C one step up with the ▶ button
+        changed = True
+        for el in caps:
+            r = [el2["name"] for el2 in d.elements].index(el["name"]) + 1
+            btn = [w for w in app.aframe.grid_slaves(row=r, column=5)][0]
+            before = el["adjusted"]
+            btn.invoke()
+            expect = bc.step_series(before, el["series"], 1)
+            changed &= el["adjusted"] == expect and el["adjusted"] > before
+        res["step_up_all_C"] = changed
+        f = [d.fl, d.f0, d.fh]
+        res["response_changes"] = bc.response_db(d, f, "adjusted") != bc.response_db(d, f, True)
+        res["plot_has_adjusted_curve"] = app.plot.adjusted is not None
+        res["table_shows_adjusted"] = all(app.tree.item(i)["values"][5] != "―"
+                                          for i in app.tree.get_children()
+                                          if app.tree.item(i)["values"][0] in [c["name"] for c in caps])
+        # 2) reset
+        app.reset_all()
+        res["reset"] = (not bc.is_adjusted(d)) and app.plot.adjusted is None
+        # 3) Up key in the entry, ◀ button, typed value, wheel on the circuit label
+        el = d.elements[0]
+        ent = app.adj_rows[el["name"]]["entry"]
+        ent.focus_force()
+        root.update()
+        before = el["adjusted"]
+        ent.event_generate("<Up>", when="now")
+        root.update()
+        res["up_key"] = el["adjusted"] > before
+        btn = app.aframe.grid_slaves(row=1, column=3)[0]
+        before = el["adjusted"]
+        btn.invoke()
+        res["left_button"] = el["adjusted"] < before
+        u = "H" if el["kind"] == "L" else "F"
+        app.adj_rows[el["name"]]["var"].set("330p" if u == "F" else "1.2u")
+        ent.event_generate("<Return>", when="now")
+        root.update()
+        res["typed_value"] = abs(el["adjusted"] - (330e-12 if u == "F" else 1.2e-6)) < 1e-18
+        el2 = d.elements[1]
+        before = el2["adjusted"]
+        app.circuit.on_wheel(el2["name"], -1)
+        res["wheel_on_circuit"] = el2["adjusted"] < before
+        app.reset_all()
+        res["ok"] = all(v for k, v in res.items())
+    except Exception as ex:  # noqa: BLE001
+        res["error"] = repr(ex)
+        res["ok"] = False
+    with open(out, "w", encoding="utf-8") as fp:
+        json.dump(res, fp, ensure_ascii=False, indent=1)
+    root.destroy()
+
+
+def _shot(root, path):
+    """Test hook: write the window rectangle for an external screen grab,
+    then quit after a few seconds."""
+    root.lift()
+    root.attributes("-topmost", True)
+    root.update()
+    with open(path, "w") as f:
+        f.write("%d %d %d %d" % (root.winfo_rootx(), root.winfo_rooty(),
+                                 root.winfo_width(), root.winfo_height()))
+    root.after(4000, root.destroy)
 
 
 if __name__ == "__main__":
