@@ -51,6 +51,56 @@ def round_e(value: float, series: str) -> float:
     return float(f"{best:.3g}") if series != "E96" else float(f"{best:.3g}")
 
 
+def step_e(value: float, series: str, steps: int) -> float:
+    """value から E 系列の標準数を steps 個（正: 大きい側、負: 小さい側）進めた値。
+
+    value が系列の値でない（任意入力された）場合、最初の1ステップは value より厳密に
+    大きい（小さい）直近の標準数になる。
+    """
+    if value <= 0 or not math.isfinite(value) or steps == 0:
+        return value
+    base = E_SERIES[series]
+    exp = math.floor(math.log10(value))
+    cands = sorted(float(f"{m * 10.0 ** e:.3g}") for e in range(exp - 2, exp + 3) for m in base)
+    tol = 1e-9
+    v = value
+    for _ in range(abs(steps)):
+        if steps > 0:
+            nxt = [c for c in cands if c > v * (1 + tol)]
+            if not nxt:
+                return v
+            v = nxt[0]
+        else:
+            prv = [c for c in cands if c < v * (1 - tol)]
+            if not prv:
+                return v
+            v = prv[-1]
+    return v
+
+
+_SI = {"f": 1e-15, "p": 1e-12, "n": 1e-9, "u": 1e-6, "µ": 1e-6, "μ": 1e-6, "m": 1e-3,
+       "k": 1e3, "K": 1e3, "M": 1e6, "G": 1e9}
+
+
+def parse_eng(text: str, unit: str) -> float:
+    """'330p', '330 pF', '1.2u', '1.2µH', '4.7e-9' などを数値に。unit は 'H' か 'F'。"""
+    t = text.strip().replace(",", "").replace(" ", "")
+    if t[-1:].upper() == unit.upper():
+        t = t[:-1]
+    mult = 1.0
+    if t and t[-1] in _SI and not t[-1].isdigit():
+        # 'm' は単位なし入力ではミリ扱い
+        mult = _SI[t[-1]]
+        t = t[:-1]
+    try:
+        v = float(t) * mult
+    except ValueError:
+        raise ValueError(f"数値として読めません: {text!r}（例: 330p, 1.2u, 4.7e-9）")
+    if not (v > 0 and math.isfinite(v)):
+        raise ValueError("素子値は正の値を入力してください。")
+    return v
+
+
 # ---------------------------------------------------------------------------
 # 低域プロトタイプの表現
 #   elements: 入力側から順に
@@ -507,6 +557,12 @@ class Arm:
     C: list            # 理想 C [F]
     Le: list = field(default_factory=list)  # E 系列 L
     Ce: list = field(default_factory=list)  # E 系列 C
+    La: list = field(default_factory=list)  # 調整後 L（初期値 = E 系列値）
+    Ca: list = field(default_factory=list)  # 調整後 C（初期値 = E 系列値）
+
+    def reset_adjust(self):
+        self.La = list(self.Le)
+        self.Ca = list(self.Ce)
 
 
 @dataclass
@@ -563,6 +619,7 @@ def design_bpf(fl, fh, n, kind, r0=50.0, ripple_db=0.5, as_db=40.0, e_l="E12", e
     for a in arms:
         a.Le = [round_e(v, e_l) for v in a.L]
         a.Ce = [round_e(v, e_c) for v in a.C]
+        a.reset_adjust()
     d = Design(arms, r0, proto.rl * r0, w0 / (2 * math.pi), fl, fh, proto.note, proto)
     if proto.ws > 0:  # 阻止域端（LPF Ω → BPF の上下2周波数）
         f0 = d.f0
@@ -588,13 +645,17 @@ def _transducer_db(stages, rs, rl):
     return 20 * math.log10(max(abs(s21), 1e-30))
 
 
-def arm_stages(arms, f, use_e=False):
+def arm_stages(arms, f, use_e=False, use_adj=False):
+    """use_adj=True: 調整後の値、use_e=True: E 系列値（設計値）、どちらも False: 理想値。"""
     w = 2 * math.pi * f
     s = 1j * w
     st = []
     for a in arms:
-        L = a.Le if use_e else a.L
-        C = a.Ce if use_e else a.C
+        if use_adj:
+            L, C = a.La, a.Ca
+        else:
+            L = a.Le if use_e else a.L
+            C = a.Ce if use_e else a.C
         if a.kind == "series_LC":
             st.append(("Z", s * L[0] + 1 / (s * C[0])))
         elif a.kind == "shunt_LC":
@@ -609,9 +670,19 @@ def arm_stages(arms, f, use_e=False):
     return st
 
 
-def response(design: Design, freqs, use_e=False):
+def response(design: Design, freqs, use_e=False, use_adj=False):
     rl_used = design.rl
-    return [_transducer_db(arm_stages(design.arms, f, use_e), design.r0, rl_used) for f in freqs]
+    return [_transducer_db(arm_stages(design.arms, f, use_e, use_adj), design.r0, rl_used) for f in freqs]
+
+
+def reset_adjust(design: Design):
+    """全素子の調整値を設計値（E 系列値）に戻す。"""
+    for a in design.arms:
+        a.reset_adjust()
+
+
+def is_adjusted(design: Design) -> bool:
+    return any(a.La != a.Le or a.Ca != a.Ce for a in design.arms)
 
 
 def log_freqs(fmin, fmax, npts=801):
